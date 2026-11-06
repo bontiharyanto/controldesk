@@ -76,6 +76,12 @@ export const FEATURE_REGISTRY = {
       "PDF-exportable monthly reports with slice B (expense register, budget burn, utilization).",
     defaultEnabled: true,
   },
+  ai_chatbot_tools: {
+    label: "AI chatbot tool calling (Level 2)",
+    description:
+      "Enables `/help?tab=ask` to call read-only tools that surface the caller's own tenant data (pending approvals, timesheet, project status, budget remaining). Turning this OFF keeps the chatbot at Level 1 (docs-only RAG) — useful for tenants with heightened data-handling requirements. Level 3 inline copilot and Level 1 chatbot are unaffected.",
+    defaultEnabled: true,
+  },
 } as const satisfies Record<
   string,
   { label: string; description: string; defaultEnabled: boolean }
@@ -110,6 +116,27 @@ export const isFeatureEnabled = cache(
     if (!tenantId) return defaultFor(key);
     try {
       const supabase = await createClient();
+      // Commercial entitlement and operational feature flag are independent:
+      // the customer must be entitled AND the rollout flag must allow it.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const entitlementResult = await (supabase as any).rpc(
+        "resolve_tenant_entitlement",
+        { p_tenant: tenantId, p_capability: key },
+      );
+      if (!entitlementResult.error) {
+        const entitlement = Array.isArray(entitlementResult.data)
+          ? entitlementResult.data[0]
+          : entitlementResult.data;
+        if (!entitlement?.enabled) return false;
+      } else {
+        // Migration-forward compatibility: deployments rolling app before DB
+        // keep prior flag behaviour instead of taking down tenant navigation.
+        log.warn("isFeatureEnabled: entitlement lookup unavailable", {
+          tenant_id: tenantId,
+          feature_key: key,
+          error: entitlementResult.error.message,
+        });
+      }
       const { data, error } = await supabase
         .from("tenant_feature_flags")
         .select("enabled")

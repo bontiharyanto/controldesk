@@ -2,6 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 
+import { assertEmployeeAssignedToProject } from "@/lib/data/assignments";
 import { withSecureAction } from "@/lib/security/action-wrapper";
 import { createClient } from "@/lib/supabase/server";
 import {
@@ -29,6 +30,21 @@ export const upsertRosterEntryAction = withSecureAction({
   handler: async (input, ctx) => {
     const supabase = await createClient();
 
+    // Guardrail — a roster row that carries a `project_id` must map
+    // to an ACTIVE assignment (member OR PM) for the target
+    // employee. This prevents data drift where HR / PM could roster
+    // someone onto a project they aren't formally assigned to and
+    // then have downstream timesheet + costing reports attribute
+    // hours incorrectly. Base-catalog rosters (`project_id` null)
+    // skip the check.
+    if (input.project_id) {
+      const err = await assertEmployeeAssignedToProject({
+        employeeId: input.employee_id,
+        projectId: input.project_id,
+      });
+      if (err) throw new Error(err);
+    }
+
     // Try to update first; if no row exists we insert.
     const { data: existing } = await supabase
       .from("employee_rosters")
@@ -39,6 +55,19 @@ export const upsertRosterEntryAction = withSecureAction({
       .maybeSingle();
 
     if (existing) {
+      // Snapshot the prior row for a diff-style audit — makes the
+      // roster edit path forensically indistinguishable from a
+      // dedicated update action. The `auditActionOverride: "UPDATE"`
+      // retag below prevents the audit log from mis-classifying this
+      // branch as a CREATE (the wrapper's default per §17 upsert
+      // convention).
+      const { data: before } = await supabase
+        .from("employee_rosters")
+        .select("shift_id, project_id, status, notes")
+        .eq("id", existing.id)
+        .eq("tenant_id", ctx.actor.tenantId)
+        .maybeSingle();
+
       const { error } = await supabase
         .from("employee_rosters")
         .update({
@@ -55,11 +84,15 @@ export const upsertRosterEntryAction = withSecureAction({
       return {
         result: { id: existing.id, updated: true },
         auditResourceId: existing.id,
+        auditActionOverride: "UPDATE",
+        auditOldValues: before ?? null,
         auditNewValues: {
           employee_id: input.employee_id,
           shift_id: input.shift_id,
           work_date: input.work_date,
+          project_id: input.project_id ?? null,
           status: input.status,
+          notes: input.notes ?? null,
         },
       };
     }

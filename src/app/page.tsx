@@ -53,6 +53,16 @@ export default async function Home() {
           ControlDesk
         </Link>
         <div className="flex items-center gap-2">
+          {isApex && (
+            <Button
+              size="sm"
+              variant="ghost"
+              nativeButton={false}
+              render={<Link href="/pricing" />}
+            >
+              {t("pricing")}
+            </Button>
+          )}
           <LanguageToggle />
           <ThemeToggle />
           <Button
@@ -67,7 +77,7 @@ export default async function Home() {
             <Button
               size="sm"
               nativeButton={false}
-              render={<Link href="/register" />}
+              render={<Link href="/register-org" />}
             >
               {t("ctaCreateWorkspace")}
               <ArrowUpRight className="size-3.5" />
@@ -106,7 +116,7 @@ export default async function Home() {
           <Button
             size="lg"
             nativeButton={false}
-            render={<Link href="/register" />}
+            render={<Link href="/register-org" />}
           >
             {t("ctaPrimary")}
             <ArrowUpRight className="size-4" />

@@ -13,8 +13,10 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { formatInTz } from "@/lib/format/date";
-import { formatIDR, parseMoneyFromDb } from "@/lib/format/money";
+import { formatIDRWithMask, parseMoneyFromDb } from "@/lib/format/money";
 import { requireCurrentEmployee } from "@/lib/auth/session";
+import { loadFieldOpsFormLookups } from "@/lib/data/lookups";
+import { loadAllowedUnitsForProjects } from "@/lib/data/project-allowed-units";
 import { resolveCapabilitiesFor } from "@/lib/rbac/capability-resolver";
 import { createClient } from "@/lib/supabase/server";
 import { BUDGET_STATUS_LABEL, BUDGET_STATUS_TONE } from "@/lib/budgets/state";
@@ -85,12 +87,29 @@ export default async function BudgetsPage() {
   if (!capabilities.can("view_budget")) {
     redirect("/dashboard?error=forbidden");
   }
+  // Rules §3 / rules §9 — PM & OM may see the budget *list* (routing
+  // + status + categories) but not the nominal figures. Amount cells
+  // render as `Rp ******` via `formatIDRWithMask()`. Admin can toggle
+  // the reverse per-tenant via `/settings/capabilities`.
+  const canViewAmount = capabilities.can("view_budget_amount");
 
-  const [budgets, projectOptions, t] = await Promise.all([
+  const [budgets, projectOptions, lookups, t] = await Promise.all([
     loadBudgets(),
     loadProjectOptions(),
+    loadFieldOpsFormLookups(),
     getTranslations("budgets"),
   ]);
+
+  // Migration 0087 — Unit Pengaju dropdown for the New Budget sheet.
+  // Reuses the Field-Ops lookups (single `unit_pengaju` master list)
+  // and the same per-project whitelist so accounting only maintains
+  // one policy surface.
+  const allowedUnitsMap = await loadAllowedUnitsForProjects(
+    projectOptions.map((p) => p.id),
+  );
+  const allowedUnitsByProject: Record<string, string[]> = Object.fromEntries(
+    allowedUnitsMap.entries(),
+  );
 
   return (
     <div className="flex flex-col gap-6">
@@ -104,7 +123,11 @@ export default async function BudgetsPage() {
             {t("subtitle")}
           </p>
         </div>
-        <NewBudgetSheet projects={projectOptions} />
+        <NewBudgetSheet
+          projects={projectOptions}
+          unitOptions={lookups.unit_pengaju}
+          allowedUnitsByProject={allowedUnitsByProject}
+        />
       </header>
 
       {budgets.length === 0 ? (
@@ -155,9 +178,11 @@ export default async function BudgetsPage() {
                         </Link>
                       </td>
                       <td className="px-4 py-3 text-right tabular-nums">
-                        {formatIDR(parseMoneyFromDb(b.total_planned_amount_db), {
-                          compact: true,
-                        })}
+                        {formatIDRWithMask(
+                          parseMoneyFromDb(b.total_planned_amount_db),
+                          canViewAmount,
+                          { compact: true },
+                        )}
                       </td>
                       <td className="px-4 py-3">
                         <FinanceStatusBadge

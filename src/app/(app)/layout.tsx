@@ -1,4 +1,4 @@
-import { cookies } from "next/headers";
+import { cookies, headers } from "next/headers";
 import { getLocale } from "next-intl/server";
 
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
@@ -6,14 +6,24 @@ import { AppSidebar } from "@/components/shell/app-sidebar";
 import { AppTopbar } from "@/components/shell/app-topbar";
 import type { NotificationItem } from "@/components/shell/notifications-bell";
 import type { InsightPreview } from "@/components/shell/ai-insights-badge";
-import { CommandPalette } from "@/components/shell/command-palette";
+import {
+  CommandPalette,
+  type KnowledgePaletteEntry,
+} from "@/components/shell/command-palette";
+import { IdleTimeoutProvider } from "@/components/shell/idle-timeout-provider";
 import { PageTransition } from "@/components/shell/page-transition";
 import { TrialBanner } from "@/components/shell/trial-banner";
+import {
+  resolveIdleTimeoutMinutes,
+  resolveIdleWarningMinutes,
+} from "@/lib/security/idle-timeout";
 import { isLocale } from "@/lib/i18n/config";
 import { requireCurrentEmployee } from "@/lib/auth/session";
 import { CAPABILITY_IDS } from "@/lib/rbac/capabilities";
 import { resolveCapabilitiesFor } from "@/lib/rbac/capability-resolver";
+import { loadTenantSearchIndex } from "@/lib/data/knowledge-articles";
 import { createClient } from "@/lib/supabase/server";
+import { HELP_MANIFEST } from "@/lib/help/articles";
 import type {
   AiInsightKind,
   AiInsightSeverity,
@@ -57,7 +67,7 @@ export default async function AppLayout({
     await Promise.all([
       supabase
         .from("tenants")
-        .select("name, slug")
+        .select("name, slug, idle_timeout_minutes, idle_warning_minutes, absolute_session_minutes")
         .eq("id", employee.tenant_id)
         .single(),
       supabase
@@ -97,38 +107,69 @@ export default async function AppLayout({
   }));
 
   const cookieStore = await cookies();
+  const requestHeaders = await headers();
+  const sessionStartedAt = Number(requestHeaders.get("x-session-started-at")) || undefined;
   const defaultOpen = cookieStore.get("sidebar_state")?.value !== "false";
 
   const rawLocale = await getLocale();
   const locale = isLocale(rawLocale) ? rawLocale : "id";
 
+  // Slug allowlist for the global Ask AI drawer's citation rewrite.
+  // The manifest is a compile-time const, so this array is free —
+  // no file I/O, no DB roundtrip. `HELP_MANIFEST` is the single
+  // source of truth for valid `/help/{slug}` targets.
+  const helpArticleSlugs = HELP_MANIFEST.map((entry) => entry.slug);
+
+  // Fase 2b: feed the Cmd+K palette with recent tenant KB articles
+  // so power users can jump to internal SOPs without leaving the
+  // keyboard. Capped at 20 to keep the palette payload lean — a
+  // fuzzy match against titles + summaries is enough for the common
+  // "which SOP was that?" flow; deep search remains on `/help`.
+  const tenantSearchIndex = await loadTenantSearchIndex();
+  const knowledgePaletteEntries: KnowledgePaletteEntry[] = tenantSearchIndex
+    .slice(0, 20)
+    .map((row) => ({
+      slug: row.slug,
+      title: row.title,
+      summary: row.summary,
+    }));
+
   return (
-    <SidebarProvider defaultOpen={defaultOpen}>
-      <CommandPalette>
-        <AppSidebar
-          role={employee.role}
-          allowedCapabilities={allowedCapabilities}
-          tenantName={tenant?.name ?? "ControlDesk"}
-          tenantSlug={employee.tenant_slug}
-        />
-        <SidebarInset className="min-h-svh flex flex-col">
-          <AppTopbar
-            fullName={employee.full_name}
-            email={employee.email}
+    <IdleTimeoutProvider
+      variant="app"
+      timeoutMinutes={tenant?.idle_timeout_minutes ?? resolveIdleTimeoutMinutes()}
+      warningMinutes={tenant?.idle_warning_minutes ?? resolveIdleWarningMinutes()}
+      absoluteMinutes={tenant?.absolute_session_minutes ?? 480}
+      sessionStartedAt={sessionStartedAt}
+    >
+      <SidebarProvider defaultOpen={defaultOpen}>
+        <CommandPalette knowledgeArticles={knowledgePaletteEntries}>
+          <AppSidebar
             role={employee.role}
+            allowedCapabilities={allowedCapabilities}
+            tenantName={tenant?.name ?? "ControlDesk"}
             tenantSlug={employee.tenant_slug}
-            userId={employee.user_id}
-            tenantId={employee.tenant_id}
-            notifications={notificationItems}
-            aiInsights={aiInsightItems}
-            locale={locale}
           />
-          <TrialBanner tenantId={employee.tenant_id} />
-          <main className="flex-1 flex flex-col p-6 md:p-8">
-            <PageTransition>{children}</PageTransition>
-          </main>
-        </SidebarInset>
-      </CommandPalette>
-    </SidebarProvider>
+          <SidebarInset className="min-h-svh flex flex-col">
+            <AppTopbar
+              fullName={employee.full_name}
+              email={employee.email}
+              role={employee.role}
+              tenantSlug={employee.tenant_slug}
+              userId={employee.user_id}
+              tenantId={employee.tenant_id}
+              notifications={notificationItems}
+              aiInsights={aiInsightItems}
+              locale={locale}
+              helpArticleSlugs={helpArticleSlugs}
+            />
+            <TrialBanner tenantId={employee.tenant_id} />
+            <main className="flex-1 flex flex-col p-6 md:p-8">
+              <PageTransition>{children}</PageTransition>
+            </main>
+          </SidebarInset>
+        </CommandPalette>
+      </SidebarProvider>
+    </IdleTimeoutProvider>
   );
 }

@@ -16,6 +16,7 @@ import {
   PORTAL_SESSION_TTL_SECONDS,
   getCurrentPortalSession,
 } from "@/lib/portal/session";
+import { SESSION_ACTIVITY_COOKIE, SESSION_STARTED_COOKIE } from "@/lib/security/session-timeout-cookie";
 import { portalLoginSchema } from "@/lib/validation/portal-auth";
 import { portalChangePasswordSchema } from "@/lib/validation/portal-change-password";
 
@@ -391,7 +392,16 @@ export async function markAllPortalNotificationsRead(): Promise<PortalMarkReadRe
 // ---------------------------------------------------------------------------
 // Logout — revoke session + clear cookie + audit.
 // ---------------------------------------------------------------------------
-export async function portalLogoutAction(): Promise<void> {
+/**
+ * Portal logout — revoke session row, clear cookie, redirect to portal login.
+ *
+ * @param reason Optional reason string appended as `?reason=<reason>` to
+ * the redirect URL. Used by the idle-timeout provider (variant="portal")
+ * to pass `idle_timeout` so the portal login page can render a
+ * "session expired" banner. Kept optional to preserve backward compat
+ * with existing callers (PortalSignOutButton).
+ */
+export async function portalLogoutAction(reason?: string): Promise<void> {
   const session = await getCurrentPortalSession();
   if (session) {
     const supabase = createServiceRoleClient();
@@ -415,5 +425,8 @@ export async function portalLogoutAction(): Promise<void> {
     path: "/",
     maxAge: 0,
   });
-  redirect("/portal/login");
+  jar.delete(SESSION_ACTIVITY_COOKIE);
+  jar.delete(SESSION_STARTED_COOKIE);
+  const query = reason ? `?reason=${encodeURIComponent(reason)}` : "";
+  redirect(`/portal/login${query}`);
 }

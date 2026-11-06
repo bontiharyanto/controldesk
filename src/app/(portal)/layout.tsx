@@ -1,11 +1,17 @@
 import Link from "next/link";
 import { getTranslations } from "next-intl/server";
+import { createServiceRoleClient } from "@/lib/supabase/server";
 
 import { Logo } from "@/components/brand/logo";
 import { LanguageToggle } from "@/components/i18n/language-toggle";
 import { ThemeToggle } from "@/components/theme/theme-toggle";
+import { IdleTimeoutProvider } from "@/components/shell/idle-timeout-provider";
 import { getTenantContext } from "@/lib/tenant/context";
 import { getCurrentPortalSession } from "@/lib/portal/session";
+import {
+  resolveIdleTimeoutMinutes,
+  resolveIdleWarningMinutes,
+} from "@/lib/security/idle-timeout";
 
 import { PortalBell } from "./portal-bell";
 import { PortalBellRefresh } from "./portal-bell-refresh";
@@ -21,8 +27,15 @@ export default async function PortalLayout({
     getCurrentPortalSession(),
     getTranslations("portal"),
   ]);
+  const policy = session
+    ? await createServiceRoleClient()
+        .from("tenants")
+        .select("idle_timeout_minutes, idle_warning_minutes, absolute_session_minutes")
+        .eq("id", session.client.tenant_id)
+        .maybeSingle()
+    : { data: null };
 
-  return (
+  const shell = (
     <div className="relative min-h-svh flex flex-col bg-background">
       <header className="sticky top-0 z-20 border-b border-border/50 bg-background/80 backdrop-blur">
         <div className="mx-auto flex w-full max-w-6xl items-center gap-3 px-6 py-3">
@@ -68,5 +81,21 @@ export default async function PortalLayout({
         {t("footer")}
       </footer>
     </div>
+  );
+
+  // Only wrap in idle-timeout provider when a portal session exists.
+  // Unauthenticated portal pages (/portal/login, /portal/forgot-password)
+  // don't need the timer — there's no session to expire.
+  if (!session) return shell;
+
+  return (
+    <IdleTimeoutProvider
+      variant="portal"
+      timeoutMinutes={policy.data?.idle_timeout_minutes ?? resolveIdleTimeoutMinutes()}
+      warningMinutes={policy.data?.idle_warning_minutes ?? resolveIdleWarningMinutes()}
+      absoluteMinutes={policy.data?.absolute_session_minutes ?? 480}
+    >
+      {shell}
+    </IdleTimeoutProvider>
   );
 }

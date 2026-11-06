@@ -279,6 +279,109 @@ Budget (project_id=X, status=ACTIVE, total_planned=100.000.000)
 system flag warning; kalau > 100%, blocking (PM harus submit Budget
 Request Increase dulu).
 
+### Visibility matrix — siapa yang bisa lihat budget?
+
+Dua lapisan yang menentukan siapa lihat apa: **UI capability** (bisa
+buka menu/halaman) + **RLS DB** (row apa yang benar-benar keluar dari
+query). Design defense-in-depth per rules §3 — kapabilitas UI bisa
+di-override admin di `/settings/capabilities`, tapi RLS tetap gate
+final.
+
+**Lapisan 1 — Capability `view_budget` (default catalog).**
+
+`src/lib/rbac/capabilities.ts:107-113` → `defaultRoles = FINANCE_MGMT`.
+Sensitivity: medium. Roles yang default-on:
+
+| DB role | Kanonikal | Default `view_budget` |
+| ------------------------- | ---------- | :-------------------: |
+| `TENANT_ADMIN`            | ADMIN      | ✅                    |
+| `GENERAL_MANAGER`         | DIRECTOR   | ✅                    |
+| `HEAD_MANAGER`            | DIRECTOR   | ✅                    |
+| `OPERATIONS_MANAGER`      | OM         | ✅                    |
+| `PROJECT_MANAGER`         | PM         | ✅                    |
+| `LEAD_FINANCE`            | FINANCE    | ✅                    |
+| `SUPERVISOR`              | SUPERVISOR | ❌ (grantable)         |
+| `HR_ADMIN`                | ADMIN      | ❌                     |
+| `EMPLOYEE`                | EMPLOYEE   | ❌                     |
+| `PETTY_CASH_CUSTODIAN`    | (deprecated) | ❌                   |
+
+Tenant admin bisa grant `view_budget` ke SUPERVISOR (atau role lain)
+per-tenant lewat matrix di `/settings/capabilities` — override
+disimpan di `tenant_capability_overrides` (migration 0081).
+
+**Lapisan 2 — RLS DB (migration 0101, defense-in-depth).**
+
+`SELECT` policy pada `public.budgets` + `public.budget_details`:
+
+```sql
+tenant_id = current_tenant_id()
+AND (
+  is_finance_management()             -- 6 roles above
+  OR is_project_member(project_id)    -- ACTIVE row di project_employee_assignments
+)
+```
+
+`is_finance_management()` mirror ke FINANCE_MGMT list (menerima both
+legacy + canonical fold per rules §6). `is_project_member()` cek
+`project_employee_assignments.status = 'ACTIVE'` — jadi employee yang
+sudah dipindahkan dari project otomatis kehilangan visibility.
+
+**Konsekuensi kombinasi caller × RLS:**
+
+| Kombinasi caller | Bisa lihat apa? |
+| --- | --- |
+| ADMIN / DIRECTOR / FINANCE / OM / PM | Semua budget di tenant, semua status |
+| SUPERVISOR / EMPLOYEE (tanpa capability override) | Budget dari **projects yang mereka assigned** saja — untuk populate MA dropdown di form expense; menu Budget tidak muncul di sidebar |
+| SUPERVISOR / EMPLOYEE + `view_budget` di-grant admin | Menu Budget muncul, tapi rows tetap terbatas ke projects mereka (RLS tidak dilonjakkan) |
+| Non-active employee (`is_active=false`) | Tidak masuk `is_project_member` — tidak lihat apa-apa |
+| Cross-tenant | Tolak di step pertama (`tenant_id` mismatch) |
+| Client portal user | Tidak masuk ke `public.employees` sama sekali — RLS langsung tolak (di layer terpisah lewat `client_users` per rules §28) |
+
+**Filter "anggaran yang disetujui" (`status = 'APPROVED'`).**
+
+`budgets.status` enum lifecycle (migration 0025):
+
+```
+DRAFT → PENDING_FINANCE → PENDING_DIRECTOR → APPROVED
+                                            → REJECTED (parking)
+```
+
+Bukan tabel/policy terpisah — visibility sama dengan matrix di atas.
+Yang membedakan hanya **surface layer** yang menambah filter
+`.eq('status', 'APPROVED')`:
+
+| Surface | Status filter |
+| --- | --- |
+| Expense form MA dropdown (`v_project_budget_lines`) | `DRAFT \| PENDING_FINANCE \| PENDING_DIRECTOR \| APPROVED` — buang REJECTED |
+| `/finance/budgets` list + `/projects/[id]` detail | Semua status (approver butuh lihat DRAFT untuk review) |
+| Dashboard KPI (portfolio realized vs planned) | Agregasi semua status; RLS auto-scope caller |
+| `runProjectPortfolio` report | Semua status; report gate di `runReport()` (`FINANCE_PLUS_PM` allowedRoles) |
+
+**Ringkasan siapa lihat apa:**
+
+| Skenario | Yang bisa lihat |
+| --- | --- |
+| Semua budget tenant (draft → approved) | TENANT_ADMIN, GENERAL_MANAGER, HEAD_MANAGER, LEAD_FINANCE, OPERATIONS_MANAGER, PROJECT_MANAGER |
+| Budget project yang di-assigned saja | SUPERVISOR + EMPLOYEE + PCC yang punya row aktif di `project_employee_assignments`; menu Budget tidak muncul, tapi bisa isi MA dropdown di expense |
+| Budget `APPROVED` saja (di expense form) | Sama seperti di atas, tapi `budget_status` di-filter di `v_project_budget_lines` |
+| Tidak lihat sama sekali | HR_ADMIN, external client portal users, employees non-assigned |
+
+**Hands-on verify.** Login sebagai role tertentu, buka DevTools console:
+
+```js
+// Semua budget yang RLS izinkan lihat
+await window.__supabase
+  .from('budgets')
+  .select('id, project_id, status, total_planned_amount')
+  .limit(20);
+
+// Source dropdown MA di expense form
+await window.__supabase.from('v_project_budget_lines').select('*').limit(20);
+```
+
+Compare `admin@demo` vs `bagas@demo` (regular EMPLOYEE di seed) — RLS
+gate langsung terlihat.
+
 ### Budget Requests
 
 **Route**: `/finance/budget-requests`. Tabel:
@@ -329,6 +432,59 @@ satu transaksi:
 Sebelum `APPLIED`, budget tetap seperti sebelumnya. Ini penting untuk
 audit — kalau approved lalu APPLIED gagal, ada gap tapi angka nyata
 aman.
+
+## Unit Pengaju — pengaju request per unit organisasi
+
+Kolom `unit_pengaju` menandai **unit / departemen mana yang mengajukan**
+transaksi keuangan — bukan siapa yang login, dan bukan siapa yang
+di-assign ke project. Field ini hanya label kategoris (bebas dipilih
+dari daftar tenant-level lookup atau di-batasi per-project bila
+whitelist di-set).
+
+**Cakupan** (migration `0087` + `a97c433`):
+
+| Modul                | Kolom                                          | Wajib? | Sumber pilihan                                                    |
+| -------------------- | ---------------------------------------------- | ------ | ----------------------------------------------------------------- |
+| Budget baru          | `budgets.unit_pengaju`                         | Opsional | Whitelist `project_allowed_units` untuk project itu, fallback ke tenant `unit_pengaju` lookup |
+| Cash Advance General | `cash_advances.unit_pengaju` (type = `GENERAL`)| Opsional | Sama seperti Budget                                              |
+| Cash Advance Field Ops | `cash_advances.unit_pengaju` (type = `FIELD_OPS`) | Opsional | Sama seperti Budget                                       |
+| Petty Cash Voucher   | `petty_cash_vouchers.unit_pengaju`             | Opsional | Tenant-level `unit_pengaju` lookup saja (petty cash tidak project-scoped) |
+
+### Cara kerja whitelist per-project
+
+Tabel `public.project_allowed_units` (migration `0086`) memungkinkan
+admin **membatasi** daftar unit pengaju yang boleh dipilih untuk
+project tertentu — mis. project "ITPS-DC-2026" hanya boleh diajukan
+oleh unit `ITPS-DC` + `IT-SUPPORT`.
+
+- Bila project punya minimal 1 entry di `project_allowed_units` →
+  dropdown "Unit Pengaju" di form Budget / CA General / Field Ops
+  mengecil ke daftar itu, hint "Filtered by project whitelist" muncul.
+- Bila project **tidak** punya entry di `project_allowed_units` →
+  dropdown menampilkan **seluruh** `unit_pengaju` tenant-level (default
+  seed 9 unit universal dari migration `0090`: NOC, Field Team, Sales,
+  HRD, IT Support, Finance, Management, Project Operations, Lain-lain).
+- Admin kelola whitelist di **`/projects/[id]/settings`** → tab
+  "Allowed Units", atau via SQL langsung untuk seeding bulk (contoh:
+  `scripts/seed-itps-project-allowed-units.sql`).
+
+### Petty Cash — kenapa tidak project-scoped?
+
+Petty cash voucher **tidak punya `project_id`** (imprest fund per lokasi,
+bukan per project). Dropdown "Unit Pengaju" di form voucher karena itu
+selalu tampilkan **semua** tenant-level `unit_pengaju`, tidak ada
+filter whitelist. Bila kebutuhan Anda adalah tracking pengeluaran per
+project, gunakan Expense atau CA (yang punya `project_id`), bukan petty
+cash.
+
+### Server-side enforcement
+
+Selain filter UI, setiap Server Action men-validate ulang lewat
+`isUnitAllowedForProject()` (helper di
+`src/lib/data/project-allowed-units.ts`) — user tidak bisa bypass
+whitelist dengan curl langsung ke Server Action. Kalau `unit_pengaju`
+yang di-submit tidak ada di whitelist project, action mengembalikan
+error `UNIT_NOT_ALLOWED_FOR_PROJECT`.
 
 ## Unified approvals inbox
 

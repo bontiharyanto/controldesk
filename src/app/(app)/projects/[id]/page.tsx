@@ -22,7 +22,7 @@ import {
 } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { formatInTz } from "@/lib/format/date";
-import { formatIDR, parseMoneyFromDb } from "@/lib/format/money";
+import { formatIDRWithMask, parseMoneyFromDb } from "@/lib/format/money";
 import { resolveCapabilitiesFor } from "@/lib/rbac/capability-resolver";
 import {
   formatRole,
@@ -33,7 +33,7 @@ import {
 import { authorize } from "@/lib/security/pdp";
 import { resolveProjectScope } from "@/lib/security/project-scope";
 import { requireCurrentEmployee } from "@/lib/auth/session";
-import { createClient } from "@/lib/supabase/server";
+import { createClient, createServiceRoleClient } from "@/lib/supabase/server";
 import { loadWorkload } from "@/lib/data/assignments";
 import { NewAssignmentSheet } from "@/app/(app)/assignments/new-assignment-sheet";
 import {
@@ -59,6 +59,7 @@ import {
   type EmployeeOption,
 } from "./milestones/new-milestone-sheet";
 import { MilestoneRowActions } from "./milestones/milestone-row-actions";
+import { EditMilestoneSheet } from "./milestones/edit-milestone-sheet";
 import { ProjectIssuesSection } from "./issues/issues-section";
 import type { IssueAssigneeOption } from "./issues/new-issue-sheet";
 import { ProjectDirectLaborSection } from "./direct-labor-section";
@@ -67,6 +68,8 @@ import {
   ProjectLifecycleBanner,
   type PmPickOption,
 } from "./lifecycle-banner";
+import { EditProjectSheet } from "./edit-project-sheet";
+import { EditBusinessCaseSheet } from "./edit-business-case-sheet";
 
 export const metadata: Metadata = { title: "Project detail" };
 
@@ -115,6 +118,12 @@ export default async function ProjectDetailPage(props: {
   // effect here too.
   const capabilities = await resolveCapabilitiesFor();
   const showBudget = capabilities.can("view_budget");
+  // Rules §3 / rules §9 — PM & OM keep the budget summary card and
+  // the recent-expenses list (they still need to know an approved
+  // budget exists + submit expenses against a MA), but the spent-of
+  // pair renders as `Rp ******`. Expense amounts on this page follow
+  // the same gate. Full nominal only for Finance-leader tier.
+  const canViewAmount = capabilities.can("view_budget_amount");
 
   const supabase = await createClient();
 
@@ -172,7 +181,19 @@ export default async function ProjectDetailPage(props: {
   ] = await Promise.all([
     supabase
       .from("projects")
-      .select("*, clients(id, name)")
+      // Explicit column list (WITHOUT `contract_value`) because that
+      // column is REVOKE'd from `authenticated` in migration 0102 —
+      // a `select("*")` would fail with `permission denied for column
+      // contract_value`. The value is fetched separately below via a
+      // service-role client, gated on `canEditProject`.
+      .select(
+        `id, tenant_id, code, project_number, name, description, priority,
+         project_type, status, progress, currency, location, start_date,
+         end_date, notes, sync_calendar, client_id, contract_id, created_by,
+         created_at, updated_at, bc_executive_summary, bc_sponsor_id,
+         bc_target_gm_pct, bc_approved_at, bc_approved_by,
+         clients(id, name)`,
+      )
       .eq("id", id)
       .eq("tenant_id", employee.tenant_id)
       .maybeSingle(),
@@ -280,7 +301,61 @@ export default async function ProjectDetailPage(props: {
     canonicalRole === "OM" ||
     canonicalRole === "DIRECTOR" ||
     canonicalRole === "ADMIN";
+
+  // OM+ / TENANT_ADMIN may edit project meta (name, timeline, contract
+  // value, etc.). Mirrors PDP `decideProject('update')` — keep both in
+  // sync (rules §17: PDP is single source of truth). Delegate the
+  // decision to `authorize()` so RLS + Server Action + UI all agree.
+  const canEditProject =
+    authorize({
+      actor: {
+        userId: employee.user_id,
+        employeeId: employee.id,
+        role: employee.role as EmployeeRole,
+        tenantId: employee.tenant_id,
+      },
+      action: "update",
+      resource: "project",
+      attributes: { tenantId: employee.tenant_id },
+    }).effect === "ALLOW";
+
+  // Contract value (rules §3) — REVOKE'd from `authenticated` in
+  // migration 0102 so a plain-JWT SELECT would fail. Fetch via
+  // service role ONLY when the caller has passed `decideProject.update`
+  // above. `EditProjectSheet` is the only downstream consumer; if
+  // the caller can't edit, we don't touch the column at all (the value
+  // isn't rendered anywhere else on this page).
+  let projectContractValue: number | string | null = null;
+  if (canEditProject) {
+    const serviceClient = createServiceRoleClient();
+    const { data: cv } = await serviceClient
+      .from("projects")
+      .select("contract_value")
+      .eq("id", id)
+      .eq("tenant_id", employee.tenant_id)
+      .maybeSingle();
+    projectContractValue = (cv?.contract_value as number | string | null) ?? null;
+  }
   const canDeleteMilestones =
+    canonicalRole === "OM" ||
+    canonicalRole === "DIRECTOR" ||
+    canonicalRole === "ADMIN";
+
+  // Tasks (WBS) — canonical PDP `decideProjectTask` (pdp-canonical.ts):
+  //   SUPERVISOR / PM / OM / DIRECTOR / ADMIN may CREATE + UPDATE.
+  //   PM / OM / DIRECTOR / ADMIN may DELETE.
+  // Mirror those role gates client-side so the row-actions menu (Edit,
+  // Add child, status transitions, progress presets, delete) hides for
+  // viewers who would only get a 403 from the server. Server still
+  // enforces via `withSecureAction()` — this is UX, not security.
+  const canManageTasks =
+    canonicalRole === "SUPERVISOR" ||
+    canonicalRole === "PM" ||
+    canonicalRole === "OM" ||
+    canonicalRole === "DIRECTOR" ||
+    canonicalRole === "ADMIN";
+  const canDeleteTasks =
+    canonicalRole === "PM" ||
     canonicalRole === "OM" ||
     canonicalRole === "DIRECTOR" ||
     canonicalRole === "ADMIN";
@@ -412,6 +487,45 @@ export default async function ProjectDetailPage(props: {
             </div>
           </div>
         </div>
+        {canEditProject ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <EditProjectSheet
+              project={{
+                id: project.id as string,
+                name: project.name as string,
+                description: (project.description as string | null) ?? null,
+                priority: (project.priority as string | null) ?? "MEDIUM",
+                project_type: project.project_type as string,
+                location: (project.location as string | null) ?? null,
+                start_date: (project.start_date as string | null) ?? null,
+                end_date: (project.end_date as string | null) ?? null,
+                contract_value: projectContractValue,
+                currency: (project.currency as string | null) ?? "IDR",
+                notes: (project.notes as string | null) ?? null,
+                sync_calendar:
+                  (project.sync_calendar as boolean | null) ?? true,
+              }}
+            />
+            {project.status === "DRAFT" || project.status === "PLANNING" ? (
+              <EditBusinessCaseSheet
+                project={{
+                  id: project.id as string,
+                  bc_executive_summary:
+                    (project.bc_executive_summary as string | null) ?? null,
+                  bc_target_gm_pct:
+                    (project.bc_target_gm_pct as number | string | null) ??
+                    null,
+                  bc_sponsor_id:
+                    (project.bc_sponsor_id as string | null) ?? null,
+                }}
+                sponsors={employeeOptions.map((e) => ({
+                  id: e.id,
+                  label: e.label,
+                }))}
+              />
+            ) : null}
+          </div>
+        ) : null}
       </header>
 
       <ProjectLifecycleBanner
@@ -460,21 +574,35 @@ export default async function ProjectDetailPage(props: {
                     <div>
                       <p className="label-meta">{t("budgetSpent")}</p>
                       <p className="font-display text-2xl font-semibold">
-                        {formatIDR(budget.spent, { compact: true })}
+                        {formatIDRWithMask(budget.spent, canViewAmount, {
+                          compact: true,
+                        })}
                       </p>
                     </div>
                     <div className="text-right">
                       <p className="label-meta">{t("budgetOf")}</p>
                       <p className="font-mono text-sm text-muted-foreground">
-                        {formatIDR(budget.amount, { compact: true })}
+                        {formatIDRWithMask(budget.amount, canViewAmount, {
+                          compact: true,
+                        })}
                       </p>
                     </div>
                   </div>
                   <div className="mt-3">
+                    {/*
+                     * Progress bar visually conveys utilisation, which
+                     * itself leaks rough budget headroom (e.g. a
+                     * near-full bar reveals over-budget risk). Under
+                     * mask we still render the bar but drop the
+                     * numeric percent — approvers who lack amount
+                     * access get a hint but not the precise ratio.
+                     */}
                     <Progress value={Math.min(100, spentPct)} />
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      {spentPct.toFixed(1)}% {t("budgetUsed")}
-                    </p>
+                    {canViewAmount ? (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {spentPct.toFixed(1)}% {t("budgetUsed")}
+                      </p>
+                    ) : null}
                   </div>
                 </>
               )}
@@ -620,12 +748,37 @@ export default async function ProjectDetailPage(props: {
                         </Badge>
                       </td>
                       <td className="px-4 py-3 text-right">
-                        <MilestoneRowActions
-                          id={m.id}
-                          status={m.status}
-                          canEdit={canEditMilestones}
-                          canDelete={canDeleteMilestones}
-                        />
+                        <div className="flex items-center justify-end gap-1">
+                          {canEditMilestones ? (
+                            <EditMilestoneSheet
+                              milestone={{
+                                id: m.id,
+                                seq: m.seq,
+                                name: m.name,
+                                description: m.description,
+                                weight_bps: m.weight_bps,
+                                planned_start_date: m.planned_start_date,
+                                planned_end_date: m.planned_end_date,
+                                owner_employee_id: m.owner_employee_id,
+                              }}
+                              employees={employeeOptions}
+                              // otherWeightBps = total across the project
+                              // minus this row (so the friendly cap in
+                              // the sheet header reflects reality).
+                              otherWeightBps={milestones.reduce(
+                                (sum, row) =>
+                                  row.id === m.id ? sum : sum + row.weight_bps,
+                                0,
+                              )}
+                            />
+                          ) : null}
+                          <MilestoneRowActions
+                            id={m.id}
+                            status={m.status}
+                            canEdit={canEditMilestones}
+                            canDelete={canDeleteMilestones}
+                          />
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -739,9 +892,11 @@ export default async function ProjectDetailPage(props: {
                       </div>
                       <div className="flex items-center gap-3">
                         <span className="tabular-nums text-sm">
-                          {formatIDR(parseMoneyFromDb(e.amount), {
-                            compact: true,
-                          })}
+                          {formatIDRWithMask(
+                            parseMoneyFromDb(e.amount),
+                            canViewAmount,
+                            { compact: true },
+                          )}
                         </span>
                         <Badge
                           variant="outline"
@@ -760,7 +915,12 @@ export default async function ProjectDetailPage(props: {
         ) : null}
       </div>
 
-      <ProjectTasksSection projectId={id} tenantId={employee.tenant_id} />
+      <ProjectTasksSection
+        projectId={id}
+        tenantId={employee.tenant_id}
+        canManage={canManageTasks}
+        canDelete={canDeleteTasks}
+      />
 
       {/* Direct Labor Cost surfaces per-employee hourly rate + cost —
           this is derived payroll data. Gate behind the same

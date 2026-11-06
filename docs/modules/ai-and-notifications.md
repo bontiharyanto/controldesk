@@ -112,6 +112,99 @@ development tanpa cost.
 req/hari, structured output kelas satu, biaya nol untuk skala kecil-menengah.
 Setup lengkap + troubleshooting → [`../integrations/ai-insights-gemini.md`](../integrations/ai-insights-gemini.md).
 
+#### Platform-wide fallback provider (Fase 4 — `AI_FALLBACK_*`)
+
+Selain provider utama per-tenant, platform admin bisa set **satu**
+fallback provider di level env. Dipakai untuk help chatbot
+(`/api/help/ask`) ketika provider utama gagal secara SYNC — SDK
+tidak bisa construct (missing key, invalid model handle), atau
+tenant belum konfigurasi AI sama sekali (memberi trial akses tanpa
+menyebarkan credential per-tenant).
+
+```
+AI_FALLBACK_PROVIDER=ollama                       # 'openai' | 'anthropic' | 'google' | 'ollama' | 'openai_compatible'
+AI_FALLBACK_MODEL_ID=llama3.1                     # atau 'gpt-4o-mini', 'claude-3-5-haiku', 'gemini-2.5-flash', ...
+AI_FALLBACK_API_KEY=optional                      # kosongkan untuk Ollama / on-prem tanpa auth
+AI_FALLBACK_BASE_URL=http://localhost:11434/v1    # hanya untuk 'ollama' / 'openai_compatible'; default sudah localhost:11434/v1
+```
+
+**Alur pemilihan**:
+
+1. `resolveAiModel(tenantId)` — coba row `tenant_ai_configs`. Kalau
+   ada + `is_active + provider != DISABLED` → pakai itu.
+2. Kalau tenant row tidak ada / DISABLED / inactive → coba env-global
+   `AI_*` (bukan fallback, cuma default kompatibilitas lama).
+3. Kalau primary null juga → coba `resolveAiFallbackModel()` dari
+   env `AI_FALLBACK_*`.
+4. Kalau primary sukses construct TAPI throw SYNC waktu streamText
+   (bad handle) → catch → retry dengan fallback.
+5. Kalau primary streaming DIMULAI tapi upstream error ASYNC (Groq
+   TPD cap balikkan 429 setelah 200 OK) → client-side empty-stream
+   guard trigger + RAG-only fallback via `/api/help/rag`.
+
+Fallback env **hanya** untuk help chatbot; AI Insights runner (cron
+sweep) tetap gagal-diam ke mock kalau primary tidak ada. Fallback
+per-tenant (via UI form) planned di Fase 2 — perlu migration +
+Settings > Integrations > AI form update.
+
+Recommended stack production kecil-menengah:
+- `AI_PROVIDER=google` + `gemini-2.5-flash` (primary, ~1500 req/hari gratis)
+- `AI_FALLBACK_PROVIDER=ollama` + `llama3.1` (fallback on-prem, unlimited)
+
+#### Bootstrap script: `pnpm ai:check` / `pnpm ai:apply`
+
+Menjalankan aplikasi di lebih dari satu environment sekaligus
+(host `pnpm dev` di `:3000` + Docker container di `:3001`, atau
+dev laptop vs VPS) rutin bikin `tenant_ai_configs.base_url` drift
+dari kondisi runtime. Contoh yang sering ditemui:
+
+- Row disimpan dengan `http://host.docker.internal:11434/v1` sewaktu
+  bekerja di Docker → user pindah ke `pnpm dev` di host → URL tersebut
+  **tidak** resolve dari process Node native (host resolver tidak
+  punya alias Docker Desktop) → chatbot balikkan "AI didn't reply".
+- Sebaliknya row `http://localhost:11434/v1` → user run di Docker
+  container → `localhost` di dalam container = container itu sendiri,
+  bukan host tempat Ollama jalan → gagal.
+
+`scripts/bootstrap-ai-endpoints.mjs` memprobe tiga kandidat URL
+(`localhost`, `127.0.0.1`, `host.docker.internal`) via `/api/tags`
+Ollama, memilih yang responsif duluan (batas 3 detik), lalu (kalau
+diberi `--apply`) meng-`UPDATE` semua row `tenant_ai_configs` yang
+provider-nya `OPENAI_COMPATIBLE` **dan** URL-nya loopback/private.
+Row cloud (Groq public, OpenAI, Anthropic, Google) tidak pernah
+di-sentuh.
+
+```bash
+pnpm ai:check                    # probe + tampilkan plan (dry-run, default)
+pnpm ai:apply                    # commit ke DB
+pnpm ai:check --verbose          # tampilkan setiap probe attempt
+
+# Skip probe, force ke URL spesifik (misal container di jaringan
+# private atau VPS internal IP):
+AI_BOOTSTRAP_TARGET_URL=http://ollama.internal:11434/v1 pnpm ai:apply
+```
+
+Output dry-run contoh:
+
+```
+── Bootstrap AI endpoints ─────────────────────────────────
+   Mode: CHECK (dry run)
+→ Probing 3 candidate URL(s)…
+   ✅ http://localhost:11434/v1 (61ms, 3 models)
+→ Target URL adopted: http://localhost:11434/v1
+→ 2 OPENAI_COMPATIBLE tenant(s) inspected:
+   SLUG    STATUS                  MODEL         CURRENT → NEW
+   demo    CHANGE                  llama3.2:3b   host.docker.internal → localhost
+   itps    SKIP (already correct)  llama3.2:3b   http://localhost:11434/v1
+→ Summary: 1 change(s), 1 skip(s)
+ℹ  Dry run — no writes. Re-run with `--apply`.
+```
+
+Idempotent — apply dua kali = kali kedua "Nothing to do". Aman dijalankan
+setiap kali switch environment. Untuk deployment nanti (VPS), bisa
+di-wire ke `entrypoint.sh` atau CI post-deploy step supaya
+provisioning otomatis.
+
 ### Locale-aware output
 
 Bahasa output mengikuti cookie `NEXT_LOCALE` yang di-set via toggle
@@ -137,6 +230,106 @@ sebelah notifikasi umum). Badge dot muncul kalau ada insight
 `/insights` adalah full page — filter by kind, severity, scope, date
 range. Mark-as-read individual atau bulk.
 
+### "Ask ControlDesk" chatbot (Level 1 + Level 2 — Fase 2/3)
+
+Route: `/help?tab=ask`. API: `POST /api/help/ask` (streaming text).
+
+**Level 1 (docs-only)**: menjawab dari `docs/` yang di-manifest di
+`src/lib/help/articles.ts`. Zero data-leak risk — tidak ada tool
+call, tidak ada akses ke tabel bisnis tenant.
+
+**Level 2 ("Ask my data" — RFC 0001)**: unlocked ketika client
+mengirim `conversationId` + `useTools=true`. Model dapat memanggil
+3 tool read-only (`list_pending_approvals`, `my_projects`,
+`expense_summary_this_month`) di `src/lib/ai/tools/index.ts`. Setiap
+tool ABAC-scoped ke caller (tenantId + employeeId injected dari
+session, tidak bisa di-override lewat argumen model). Detail
+threat-model + tool inventory ada di
+[docs/rfc/0001-ask-my-data.md](../rfc/0001-ask-my-data.md).
+
+**Pipeline**:
+
+1. **Retrieval** — `src/lib/help/retrieval.ts`. Two-tier: embedding-first,
+   keyword fallback. Query dikirim ke `gemini-embedding-001` (768-dim
+   Matryoshka), cosine similarity vs index statis di
+   `src/lib/help/embeddings.json` yang di-precompute via `pnpm
+   help:reindex`. Kalau API key kosong / provider gagal / index kosong,
+   fallback ke Fuse.js keyword search. Top-3 artikel jadi CONTEXT.
+   Setiap hit di-tag `retrievalMode: "embedding" | "keyword" |
+   "manifest"` untuk observability.
+2. **Prompt** — `src/lib/help/chat-prompt.ts`. Sistem prompt tersegel
+   dengan guardrail: locale-aware refusal, cross-tenant isolation
+   ("NEVER discuss any tenant other than X"), no mutation offers, dan
+   citation contract (`[slug]` → link ke `/help/{slug}`).
+3. **Model** — resolve via `resolveAiModel(tenantId)` yang sudah
+   dipakai insight generator, jadi tenant AI config di
+   `/settings/integrations/ai` langsung berlaku untuk chatbot.
+4. **Streaming** — `streamText()` dari Vercel AI SDK, di-return sebagai
+   `text/plain` SSE. Client (`HelpAskPanel`) baca via
+   `res.body.getReader()` tanpa dep `@ai-sdk/react`.
+5. **Rate limit + cost cap** — dua Redis buckets:
+   `helpChatPerUser` (6/menit) + `helpChatPerTenant` (60/menit). Token
+   reservasi via `reserve()` (rules §15), commit delta pada
+   `onFinish`.
+
+**Ephemeral by design**: chat history tidak disimpan ke DB (per pilihan
+user Fase 2). Message list hidup di client state; refresh → wipe.
+
+**Citation rewrite**: assistant reply yang menulis `[overview]` di-
+render sebagai link `<Link href="/help/overview">`. Slug allowlist
+diambil dari manifest RSC — hallucination `[foo-bar]` yang tidak ada
+di manifest tetap ditampilkan sebagai teks polos, tidak jadi link
+mati.
+
+**Telemetry**: `log.info("help_chat_reply", {...})` per reply — model
+id, input/output tokens, latency, dan daftar slug yang di-retrieve
+plus retrieval mode-nya. `log.info("help_retrieval_embedding", {...})`
+di-log setiap kali embedding tier berhasil, dengan hit scores untuk
+audit relevansi. Tidak menyentuh `ai_insights` (schema itu untuk 4
+structured generator, bukan chat).
+
+**Reindex embeddings**: setiap kali `HELP_MANIFEST` atau isi markdown
+di `docs/` berubah, jalankan `pnpm help:reindex` (butuh
+`HELP_EMBEDDING_API_KEY` atau `GOOGLE_GENERATIVE_AI_API_KEY`).
+Content-hashed jadi idempotent — hanya artikel yang berubah yang di-
+embed ulang. Output ke `src/lib/help/embeddings.json` (~400 KB, 16
+artikel × 768 dims). Commit bersama perubahan doc.
+
+### Inline AI copilot (Level 3 — Fase 2)
+
+Route: `POST /api/ai/copilot`. Reusable client: `<AiCopilot>` di
+`src/components/ai/ai-copilot.tsx`.
+
+"AI-assist" per-field untuk form. Tombol Sparkles kecil di sebelah
+label textarea → popover streaming saran → Accept / Regenerate /
+Cancel. Wired ke 4 surface:
+
+| Surface | Field | Konteks yang dikirim |
+|---|---|---|
+| `ca_purpose` | Cash Advance General → `purpose` | amount, project_name |
+| `field_ops_justification` | Cash Advance FieldOps → `justification` | project, area, tujuan, ticket, transport, PIC |
+| `expense_description` | Project Expense → `notes` | amount, project, category |
+| `project_description` | Project Wizard → `description` | project, client, dates, contract value |
+
+Registry per-surface di `src/lib/ai/copilot-surfaces.ts` — masing-
+masing punya prompt template, allowlist context keys, dan
+`maxOutputTokens` (≤ 240). Server-side memfilter context keys sebelum
+di-render ke prompt: apa pun di luar allowlist di-drop diam-diam
+(tidak diteruskan ke LLM).
+
+**Isolation**: tenant di-pull dari session, tidak bisa di-override
+lewat body. Copilot **tidak** melakukan DB read tambahan — client
+mengirimkan value yang sudah dilihat user di form. Kalau tidak
+kelihatan di form, LLM tidak dapat.
+
+**Rate limit**: `aiCopilotPerUser` (12/menit) +
+`aiCopilotPerTenant` (120/menit). Cost cap sama dengan chatbot —
+`reserve()` sebelum call, commit delta di `onFinish`.
+
+**Telemetry**: `log.info("ai_copilot_reply", {...})` per reply —
+surface, model, input/output tokens, latency, user draft length, dan
+context keys yang lolos filter.
+
 ## Part 2 — Notifications system
 
 Tiga surface paralel:
@@ -159,6 +352,30 @@ Tiga surface paralel:
    Timesheet dan bulk-import event tetap in-app only (tidak di allowlist).
    Cron digest + settlement reminders + self-signup masih menulis
    `email_outbox` sendiri dengan skeleton yang sama.
+
+   **Tenant isolation (kritikal)**: dispatcher pakai `createServiceRoleClient()`
+   untuk bisa jalan dari Server Action **dan** cron route yang tidak
+   punya session cookie. RLS di-bypass, jadi isolasi tenant di-enforce
+   oleh **3 layer eksplisit**:
+   (1) `.eq("tenant_id", input.tenantId)` di query `employees`;
+   (2) `.eq("id", input.tenantId)` di query `tenants`;
+   (3) sanity check `tenant.id === input.tenantId` post-load — bail
+   kalau row leak.
+   CTA URL selalu di-build dari `tenant.slug` yang di-fetch pakai
+   `input.tenantId`, bukan dari heuristik. Outbox row juga di-tag
+   dengan `input.tenantId`, bukan `tenant.id` dari row (defensive).
+   Cross-tenant regression test locked di
+   [`email-dispatcher.test.ts`](../../src/lib/notifications/email-dispatcher.test.ts).
+
+   `isChannelEnabled()` dan `loadEnabledMap()` di
+   [`preferences.ts`](../../src/lib/notifications/preferences.ts) juga
+   pakai `createServiceRoleClient()` — perlu supaya dispatcher bisa
+   baca preferensi user LAIN (approver, subordinate). Kalau pakai
+   session client, RLS scope `user_id = auth.uid()` bikin lookup
+   preferensi user lain balik null → fail-open → user yang opt-out
+   tetap dikirimi email (bug lama sebelum fix). Public UI reader
+   (`loadPreferencesForUser`) tetap pakai session client karena
+   hanya baca row user sendiri.
 5. **Realtime** — Supabase Realtime `postgres_changes` untuk
    auto-refresh UI notifikasi + approval inbox.
 

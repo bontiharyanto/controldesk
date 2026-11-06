@@ -1,9 +1,9 @@
 import {
   Archive,
-  ArrowLeftRight,
   BadgeDollarSign,
   Banknote,
   BookOpen,
+  BookText,
   BrainCircuit,
   Briefcase,
   CalendarClock,
@@ -13,6 +13,7 @@ import {
   Coins,
   FileClock,
   FileText,
+  HandCoins,
   Home,
   KeyRound,
   LayoutGrid,
@@ -23,6 +24,7 @@ import {
   Scale,
   ShieldCheck,
   Sparkles,
+  Target,
   ToggleRight,
   Upload,
   UserCog,
@@ -98,7 +100,10 @@ export const NAV_SECTIONS: NavSection[] = [
   {
     labelKey: "overview",
     items: [
-      { titleKey: "dashboard", href: "/dashboard", icon: Home },
+      // Dashboard is the primary landing surface for every role — keep
+      // it at the top of the sidebar regardless of how "Dashboard" /
+      // "AI Insights" sort alphabetically in the active locale.
+      { titleKey: "dashboard", href: "/dashboard", icon: Home, pinned: true },
       {
         titleKey: "insights",
         href: "/insights",
@@ -138,13 +143,15 @@ export const NAV_SECTIONS: NavSection[] = [
       // /hr/employees (People > Karyawan) as of the Employees module. The
       // legacy `/team` URL still resolves via a server redirect so old
       // bookmarks remain valid; see `src/app/(app)/team/page.tsx`.
-      {
-        titleKey: "handovers",
-        href: "/handovers",
-        icon: ArrowLeftRight,
-        // PM handover notes — capability `view_handover`.
-        capabilityId: "view_handover",
-      },
+      //
+      // NOTE: "PM Handovers" nav entry retired per .cursorrules §13.
+      // The dedicated module is DEPRECATED in favour of editing
+      // `project_employee_assignments` directly (set outgoing PM to
+      // `Completed`, insert new row for the incoming PM). The
+      // `/handovers` route still resolves for backward-compat until
+      // the Fase 0.4 migration drops the `pm_handovers` table
+      // entirely, but we no longer surface it in the sidebar so new
+      // tenants don't discover a workflow that's going away.
     ],
   },
   {
@@ -199,6 +206,10 @@ export const NAV_SECTIONS: NavSection[] = [
         href: "/hr/employees",
         icon: Users,
         capabilityId: "view_employee_directory",
+        // Employee directory is the People-section entry point — pin
+        // it so the sidebar doesn't hide it under "Cuti & Lembur" /
+        // "Evaluasi Performa" (which sort earlier alphabetically).
+        pinned: true,
       },
       { titleKey: "roster", href: "/hr/roster", icon: CalendarDays },
       {
@@ -227,19 +238,22 @@ export const NAV_SECTIONS: NavSection[] = [
       {
         titleKey: "performance",
         href: "/hr/performance",
-        icon: BadgeDollarSign,
+        icon: Target,
         // HR performance evaluations — capability `view_performance`.
         // Row-level RLS on `performance_evaluations` (migration 0059)
-        // is complementary.
+        // is complementary. Icon deliberately distinct from
+        // `budgets` (BadgeDollarSign) so users don't confuse the two.
         capabilityId: "view_performance",
       },
       {
         titleKey: "upk",
         href: "/hr/upk",
-        icon: Banknote,
+        icon: HandCoins,
         // Termination severance (UPK) notes — capability `view_upk`.
         // High-sensitivity: admin toggle at `/settings/capabilities`
-        // warns before non-default grants.
+        // warns before non-default grants. Icon distinct from
+        // `payroll` (Banknote) so the two money-transfer surfaces
+        // don't visually collide.
         capabilityId: "view_upk",
       },
       {
@@ -297,6 +311,30 @@ export const NAV_SECTIONS: NavSection[] = [
         titleKey: "preferences",
         href: "/settings/preferences",
         icon: Sparkles,
+        // Universal for every authenticated user — pin so it doesn't
+        // drift down into the admin cluster after alphabetical sort.
+        pinned: true,
+      },
+      {
+        // In-app knowledge base — visible to every authenticated user
+        // for the same reason preferences is (universal, non-admin).
+        // Content is static from `docs/`; no RLS surface. See
+        // `src/lib/help/articles.ts` for the manifest.
+        titleKey: "help",
+        href: "/help",
+        icon: BookOpen,
+        pinned: true,
+      },
+      {
+        // Tenant-authored knowledge base — the writable counterpart
+        // to `/help`. Rows live in `knowledge_articles` (migration
+        // 0095); RLS filters DRAFTs to author + admin. Universal
+        // read; every employee can also write drafts. Pinned so it
+        // sits next to /help in the sidebar for discoverability.
+        titleKey: "knowledge",
+        href: "/knowledge",
+        icon: BookText,
+        pinned: true,
       },
       {
         titleKey: "users",
@@ -355,7 +393,10 @@ export const NAV_SECTIONS: NavSection[] = [
       {
         titleKey: "coa",
         href: "/settings/coa",
-        icon: BookOpen,
+        icon: BookText,
+        // Chart of Accounts — icon distinct from `help` (BookOpen)
+        // so users don't confuse a finance master-data screen with
+        // the in-app knowledge base.
         roles: ["TENANT_ADMIN", "LEAD_FINANCE"],
       },
       {

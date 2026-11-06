@@ -17,15 +17,6 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
   Form,
   FormControl,
   FormDescription,
@@ -42,6 +33,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  Sheet,
+  SheetClose,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import type { CoaAccountWithChildren } from "@/lib/data/coa";
@@ -212,7 +212,7 @@ export function CoaManager({ tree }: { tree: CoaAccountWithChildren[] }) {
     return rows.filter((r) => !banned.has(r.id) && r.is_active);
   }, [rows, editor]);
 
-  function closeDialog() {
+  function closeEditor() {
     setEditor(null);
   }
 
@@ -233,7 +233,7 @@ export function CoaManager({ tree }: { tree: CoaAccountWithChildren[] }) {
         const result = await createCoaAction(payload);
         if (result.ok) {
           toast.success(t("createdToast"));
-          closeDialog();
+          closeEditor();
           router.refresh();
         } else {
           toast.error(result.reason ?? t("failedCreate"));
@@ -245,7 +245,7 @@ export function CoaManager({ tree }: { tree: CoaAccountWithChildren[] }) {
         });
         if (result.ok) {
           toast.success(t("updatedToast"));
-          closeDialog();
+          closeEditor();
           router.refresh();
         } else {
           toast.error(result.reason ?? t("failedUpdate"));
@@ -426,28 +426,31 @@ export function CoaManager({ tree }: { tree: CoaAccountWithChildren[] }) {
         </CardContent>
       </Card>
 
-      <Dialog
+      <Sheet
         open={editor !== null}
-        onOpenChange={(open) => (open ? null : closeDialog())}
+        onOpenChange={(open) => (open ? null : closeEditor())}
       >
-        <DialogContent className="max-w-lg">
-          <DialogHeader>
-            <DialogTitle>
+        <SheetContent
+          side="right"
+          className="data-[side=right]:w-full data-[side=right]:sm:max-w-xl data-[side=right]:md:max-w-2xl"
+        >
+          <SheetHeader>
+            <SheetTitle>
               {editor?.kind === "edit" ? t("editTitle") : t("createTitle")}
-            </DialogTitle>
-            <DialogDescription>
+            </SheetTitle>
+            <SheetDescription>
               {editor?.kind === "edit"
                 ? t("editDescription")
                 : t("createDescription")}
-            </DialogDescription>
-          </DialogHeader>
+            </SheetDescription>
+          </SheetHeader>
 
           <Form {...form}>
             <form
               onSubmit={form.handleSubmit(onSubmit)}
-              className="space-y-4"
+              className="@container flex flex-1 flex-col gap-5 overflow-y-auto px-5"
             >
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid gap-4 @md:grid-cols-2">
                 <FormField
                   control={form.control}
                   name="code"
@@ -488,8 +491,14 @@ export function CoaManager({ tree }: { tree: CoaAccountWithChildren[] }) {
                         }}
                       >
                         <FormControl>
-                          <SelectTrigger>
-                            <SelectValue />
+                          <SelectTrigger className="w-full">
+                            <SelectValue>
+                              {(value) =>
+                                value
+                                  ? tTypes(value as CoaAccountType)
+                                  : t("fields.type")
+                              }
+                            </SelectValue>
                           </SelectTrigger>
                         </FormControl>
                         <SelectContent>
@@ -524,7 +533,7 @@ export function CoaManager({ tree }: { tree: CoaAccountWithChildren[] }) {
                 )}
               />
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid gap-4 @md:grid-cols-2">
                 <FormField
                   control={form.control}
                   name="normal_side"
@@ -536,8 +545,14 @@ export function CoaManager({ tree }: { tree: CoaAccountWithChildren[] }) {
                         onValueChange={(v) => field.onChange(v as CoaNormalSide)}
                       >
                         <FormControl>
-                          <SelectTrigger>
-                            <SelectValue />
+                          <SelectTrigger className="w-full">
+                            <SelectValue>
+                              {(value) =>
+                                value
+                                  ? tSides(value as CoaNormalSide)
+                                  : t("fields.normalSide")
+                              }
+                            </SelectValue>
                           </SelectTrigger>
                         </FormControl>
                         <SelectContent>
@@ -565,8 +580,20 @@ export function CoaManager({ tree }: { tree: CoaAccountWithChildren[] }) {
                         }
                       >
                         <FormControl>
-                          <SelectTrigger>
-                            <SelectValue />
+                          <SelectTrigger className="w-full">
+                            <SelectValue>
+                              {(value) => {
+                                if (!value || value === "__none__") {
+                                  return t("parentNone");
+                                }
+                                const hit = parentOptions.find(
+                                  (r) => r.id === value,
+                                );
+                                return hit
+                                  ? `${"— ".repeat(hit.depth)}${hit.code} · ${hit.name}`
+                                  : String(value);
+                              }}
+                            </SelectValue>
                           </SelectTrigger>
                         </FormControl>
                         <SelectContent>
@@ -597,7 +624,7 @@ export function CoaManager({ tree }: { tree: CoaAccountWithChildren[] }) {
                       <Textarea
                         {...field}
                         placeholder={t("descriptionPlaceholder")}
-                        rows={2}
+                        rows={3}
                       />
                     </FormControl>
                     <FormMessage />
@@ -609,10 +636,10 @@ export function CoaManager({ tree }: { tree: CoaAccountWithChildren[] }) {
                 control={form.control}
                 name="is_postable"
                 render={({ field }) => (
-                  <FormItem className="flex flex-row items-center justify-between rounded-lg border border-white/10 bg-white/5 p-3">
-                    <div className="space-y-0.5">
+                  <FormItem className="flex flex-row items-center justify-between gap-4 rounded-lg border border-border/60 bg-muted/30 p-4">
+                    <div className="space-y-1">
                       <FormLabel>{t("fields.postable")}</FormLabel>
-                      <FormDescription>
+                      <FormDescription className="text-xs leading-relaxed">
                         {t("postableHint")}
                       </FormDescription>
                     </div>
@@ -626,28 +653,25 @@ export function CoaManager({ tree }: { tree: CoaAccountWithChildren[] }) {
                 )}
               />
 
-              <DialogFooter>
-                <DialogClose
+              <SheetFooter className="sticky bottom-0 mt-auto -mx-5 flex-row flex-wrap items-center justify-end gap-2 border-t border-border/60 bg-popover px-5 py-3">
+                <SheetClose
                   render={
-                    <Button type="button" variant="ghost">
+                    <Button type="button" variant="ghost" disabled={isPending}>
                       {t("cancel")}
                     </Button>
                   }
                 />
                 <Button type="submit" disabled={isPending}>
                   {isPending ? (
-                    <Loader2 className="size-4 animate-spin" />
-                  ) : editor?.kind === "edit" ? (
-                    t("save")
-                  ) : (
-                    t("createAccount")
-                  )}
+                    <Loader2 className="mr-2 size-4 animate-spin" />
+                  ) : null}
+                  {editor?.kind === "edit" ? t("save") : t("createAccount")}
                 </Button>
-              </DialogFooter>
+              </SheetFooter>
             </form>
           </Form>
-        </DialogContent>
-      </Dialog>
+        </SheetContent>
+      </Sheet>
     </>
   );
 }

@@ -6,6 +6,13 @@ import { resolveTenantFromHost } from "@/lib/tenant/resolve";
 import { TENANT_HEADER, TENANT_ID_HEADER } from "@/lib/tenant/context";
 import { decodeJwtPayload } from "@/lib/auth/jwt-claims";
 import { log } from "@/lib/observability/log";
+import {
+  SESSION_ACTIVITY_COOKIE,
+  SESSION_STARTED_COOKIE,
+  createSessionTimestamp,
+  sessionCookieOptions,
+  verifySessionTimestamp,
+} from "@/lib/security/session-timeout-cookie";
 
 /**
  * Next 16 renamed `middleware.ts` → `proxy.ts` (see `node_modules/next/dist/docs/01-app/03-api-reference/03-file-conventions/proxy.md`).
@@ -19,7 +26,16 @@ import { log } from "@/lib/observability/log";
  *   5. Passing the resolved tenant slug/id downstream via request headers.
  */
 
-const PUBLIC_PATHS = new Set(["/login", "/register", "/forgot-password"]);
+const PUBLIC_PATHS = new Set([
+  "/login",
+  "/register",
+  "/forgot-password",
+  // PWA offline fallback shell — served by the Service Worker when
+  // the user's device drops connectivity, so it MUST be reachable
+  // without a Supabase session or tenant JWT. Contents are branded
+  // marketing / instructional only; no PII.
+  "/~offline",
+]);
 const PUBLIC_PREFIXES = ["/auth", "/api/auth"];
 
 function isPublicPath(pathname: string): boolean {
@@ -45,8 +61,26 @@ const OPS_BYPASS_PATHS = new Set([
   "/api/ready",
   "/api/version",
   "/api/observability/report",
+  // PWA public assets — must be reachable pre-auth so the browser can
+  // register the SW + install the app before the user signs in.
+  "/manifest.webmanifest",
 ]);
-const OPS_BYPASS_PREFIXES = ["/api/cron/"];
+// PWA / SW paths. `/serwist/` is Serwist's Route Handler surface
+// (`sw.js`, precache manifest). Icons under `/icons/` are static assets
+// that need to be reachable pre-auth (splash / launcher tile). Both
+// bypass tenant + auth so the browser can pull them during PWA install.
+//
+// `/.well-known/` is a reserved namespace (RFC 8615). Google Play
+// Services fetches `/.well-known/assetlinks.json` during TWA install
+// to verify the app ↔ site pairing — it MUST return 200 without auth,
+// or the TWA falls back to Custom Tabs (browser chrome visible). Same
+// bypass covers future ACME challenge tokens if we ever move off Caddy.
+const OPS_BYPASS_PREFIXES = [
+  "/api/cron/",
+  "/serwist/",
+  "/icons/",
+  "/.well-known/",
+];
 
 function ensureRequestId(request: NextRequest): string {
   const existing = request.headers.get("x-request-id");
@@ -86,8 +120,22 @@ export async function proxy(request: NextRequest) {
   // through. `/login` is included because that's where platform admins
   // sign in from apex.
   if (tenant.kind === "apex") {
+    // Legacy `/register` links (from old emails / bookmarks / the marketing
+    // page before Aug 2026) still point at what used to be a partially-wired
+    // in-app "Create workspace" flow under `src/app/(auth)/register/`. That
+    // flow was retired in favour of the full `/register-org` funnel
+    // (verification email + slug provisioning + super-admin visibility).
+    // A 308 permanent redirect keeps those old links functional AND signals
+    // to crawlers to update their target — a proxy rewrite would leave the
+    // wrong URL in the browser bar and confuse anyone who bookmarked it.
+    if (pathname === "/register" || pathname.startsWith("/register/")) {
+      const url = request.nextUrl.clone();
+      url.pathname = "/register-org";
+      return NextResponse.redirect(url, 308);
+    }
     if (
       pathname === "/" ||
+      pathname === "/pricing" ||
       pathname.startsWith("/marketing") ||
       pathname.startsWith("/super-admin") ||
       pathname.startsWith("/register-org") ||
@@ -95,6 +143,7 @@ export async function proxy(request: NextRequest) {
       pathname === "/forgot-password" ||
       pathname.startsWith("/auth") ||
       pathname.startsWith("/api/auth")
+      || pathname === "/api/session/activity"
     ) {
       return NextResponse.next({ request });
     }
@@ -126,8 +175,13 @@ export async function proxy(request: NextRequest) {
   // in portal Server Actions.
   const requestHeaders = new Headers(request.headers);
   requestHeaders.set("x-request-id", requestId);
+  let sessionPolicy: {
+    idle_timeout_minutes: number;
+    idle_warning_minutes: number;
+    absolute_session_minutes: number;
+  } | null = null;
 
-  // --- Tenant lifecycle guard (Fase 2, migration 0077). ---
+  // --- Tenant lifecycle + commercial access guard (migration 0104). ---
   // Suspended/terminated tenants get a static "suspended" page instead
   // of any app content. This runs before session refresh so we don't
   // burn a DB round-trip refreshing tokens for a tenant nobody can
@@ -140,15 +194,26 @@ export async function proxy(request: NextRequest) {
       process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
       { cookies: { getAll: () => [], setAll: () => {} } },
     );
-    const { data: status } = await anonForStatus.rpc(
-      "resolve_tenant_status_by_slug",
+    // The cast keeps this migration-forward RPC usable before generated DB
+    // types are refreshed in a deployment pipeline.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: accessMode } = await (anonForStatus as any).rpc(
+      "resolve_tenant_access_by_slug",
       { p_slug: tenant.slug },
     );
-    if (status && status !== "active") {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const policyResult = await (anonForStatus as any).rpc(
+      "resolve_tenant_session_policy_by_slug",
+      { p_slug: tenant.slug },
+    );
+    sessionPolicy = Array.isArray(policyResult.data)
+      ? (policyResult.data[0] ?? null)
+      : (policyResult.data ?? null);
+    if (accessMode && accessMode !== "full" && accessMode !== "read_only") {
       // Suspended → send to /suspended (rewrite so URL stays intact).
       // Terminated → 410 Gone. Both preserved for the same reason: no
       // cookie shuffling for a dead tenant.
-      if (status === "terminated") {
+      if (accessMode === "terminated") {
         return new NextResponse(`Tenant terminated: ${tenant.slug}`, {
           status: 410,
           headers: { "content-type": "text/plain; charset=utf-8" },
@@ -159,7 +224,23 @@ export async function proxy(request: NextRequest) {
       url.searchParams.set("slug", tenant.slug);
       return NextResponse.rewrite(url);
     }
-    // status === null → tenant slug not in DB. Fall through so the app
+    if (accessMode === "read_only") {
+      requestHeaders.set("x-tenant-access-mode", "read_only");
+      const isMutation = !["GET", "HEAD", "OPTIONS"].includes(request.method);
+      // Login/auth remains usable so customers can inspect and export data.
+      // All application Server Actions are POST and are rejected here.
+      if (isMutation && !isPublicPath(pathname) && !isPortalPath(pathname)) {
+        return NextResponse.json(
+          {
+            error: "TENANT_READ_ONLY",
+            message:
+              "Workspace berada dalam masa read-only. Hubungi billing atau support untuk reaktivasi.",
+          },
+          { status: 423, headers: { "x-request-id": requestId } },
+        );
+      }
+    }
+    // accessMode === null → tenant slug not in DB. Fall through so the app
     // still returns 404 for unknown tenants via its normal render path.
   } catch (err) {
     // Never let a status-check failure block the site — degrade to
@@ -302,6 +383,40 @@ export async function proxy(request: NextRequest) {
     url.pathname = "/login";
     url.searchParams.set("next", pathname);
     return NextResponse.redirect(url);
+  }
+
+  // Server-side enterprise timeout. Both timestamps are HMAC-signed and
+  // HttpOnly, so client JavaScript can request a heartbeat but cannot forge
+  // a later activity or session-start value. Absolute lifetime never slides.
+  if (sessionPolicy) {
+    const now = Date.now();
+    const [startedAt, activeAt] = await Promise.all([
+      verifySessionTimestamp(request.cookies.get(SESSION_STARTED_COOKIE)?.value),
+      verifySessionTimestamp(request.cookies.get(SESSION_ACTIVITY_COOKIE)?.value),
+    ]);
+    const idleExpired = activeAt !== null &&
+      now - activeAt >= sessionPolicy.idle_timeout_minutes * 60_000;
+    const absoluteExpired = startedAt !== null &&
+      now - startedAt >= sessionPolicy.absolute_session_minutes * 60_000;
+    if (idleExpired || absoluteExpired) {
+      await supabase.auth.signOut();
+      const url = request.nextUrl.clone();
+      url.pathname = "/login";
+      url.searchParams.set("reason", absoluteExpired ? "absolute_timeout" : "idle_timeout");
+      const response = NextResponse.redirect(url);
+      response.cookies.delete(SESSION_STARTED_COOKIE);
+      response.cookies.delete(SESSION_ACTIVITY_COOKIE);
+      for (const c of pendingCookies) response.cookies.set(c.name, c.value, c.options);
+      return response;
+    }
+    const signedNow = await createSessionTimestamp(now);
+    if (startedAt === null) {
+      pendingCookies.push({ name: SESSION_STARTED_COOKIE, value: signedNow, options: sessionCookieOptions });
+    }
+    if (activeAt === null) {
+      pendingCookies.push({ name: SESSION_ACTIVITY_COOKIE, value: signedNow, options: sessionCookieOptions });
+    }
+    requestHeaders.set("x-session-started-at", String(startedAt ?? now));
   }
 
   // --- Cross-tenant guard: JWT tenant_id must match the URL's tenant. ---

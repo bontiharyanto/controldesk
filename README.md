@@ -118,7 +118,7 @@ audience (business owner / end user / engineer / auditor / on-call).
 | Cache / Rate limit  | Redis (docker-compose service)                         |
 | Email               | Nodemailer + `email_outbox` audit trail                |
 | Testing             | Vitest + `@vitest/coverage-v8` + Playwright            |
-| Container           | Multi-stage Node 20 Alpine → standalone runtime        |
+| Container           | Multi-stage Node 22 Alpine → standalone runtime        |
 | Package manager     | pnpm 9                                                 |
 | Observability       | Structured JSON logs + Sentry / Axiom sink             |
 
@@ -144,7 +144,7 @@ pnpm db:types
 
 # 6. Run the app.
 pnpm dev                           # Next.js dev (recommended)
-docker compose up -d --build       # OR the full production-shape stack
+docker compose --env-file .env.local up -d --build   # OR the full production-shape stack
 ```
 
 Open **[http://demo.localhost:3000](http://demo.localhost:3000)** and
@@ -183,14 +183,14 @@ and mismatches force a sign-out.
 | `pnpm db:reset`                | Drop + reapply all migrations + reload seed.                       |
 | `pnpm db:types`                | Regenerate `src/types/database.ts` from the local DB.              |
 | `pnpm db:diff -f <name>`       | Snapshot pending schema changes to a new migration.                |
-| `docker compose up -d --build` | Build + run the containerised stack (`app` + `redis` + `mailpit`). |
+| `docker compose --env-file .env.local up -d --build` | Build + run the containerised stack (`app` + `redis` + `mailpit`). `--env-file` is required because `NEXT_PUBLIC_*` values are baked at build-time and Compose doesn't read `.env.local` for `build.args` by default. |
 
 ## Directory map
 
 ```text
 controldesk/
 ├── proxy.ts                            # Next 16 tenant guard + request-id
-├── Dockerfile                          # Multi-stage Node 20 Alpine → standalone
+├── Dockerfile                          # Multi-stage Node 22 Alpine → standalone
 ├── docker-compose.yml                  # app + redis + mailpit
 ├── vercel.json                         # Cron schedules
 ├── .github/                            # Workflows + templates + CODEOWNERS
